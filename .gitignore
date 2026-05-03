@@ -1,0 +1,24 @@
+# Build artifacts
+dist/
+*.skill
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Skill workspaces (from skill-creator iterations)
+*-workspace/
