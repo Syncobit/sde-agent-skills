@@ -97,6 +97,11 @@ def validate_skill(skill_dir: Path) -> list[str]:
             errors.append(
                 f"description is too short ({desc_len} chars); needs ~50+ to trigger reliably"
             )
+        # Claude.ai upload enforces a 1024-char hard cap on description.
+        if desc_len > 1024:
+            errors.append(
+                f"description is too long ({desc_len} chars); Claude.ai rejects uploads over 1024 chars"
+            )
 
     # Check that referenced files exist (heuristic: any references/X.md path mentioned in SKILL.md)
     body = content.split("---", 2)[-1] if content.startswith("---") else content
