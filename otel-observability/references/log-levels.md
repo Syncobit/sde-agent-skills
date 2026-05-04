@@ -199,6 +199,284 @@ For Syncobit's services, the recommended baseline:
 
 **Per-logger override**: most logging frameworks let you set different levels for different loggers (`com.example.security` vs `com.example.metrics`). Use this to keep noisy subsystems quiet without hiding everything else. A common pattern: noisy library loggers (HTTP clients, ORM SQL logging) at WARN even when application code is at INFO.
 
+## Enterprise operational layer
+
+The severity decisions above govern individual log statements. The operational layer governs how log streams flow through the organization — channels, retention, access, runtime control. This is what separates "we use OTel logs" from "our logging meets SOC 2 / HIPAA / financial-services controls".
+
+### Audit logs are not operational logs
+
+The single most common enterprise mistake: shipping security-relevant events through the same pipeline as routine INFO traffic. They have different requirements:
+
+| Concern | Operational logs | Audit logs |
+|---------|-----------------|------------|
+| Captures | Service lifecycle, errors, debug info | Authentication, authorization, data access, configuration changes, privileged actions |
+| Retention | 7-30 days hot, 30-90 days cold | 1-7 years (regulatory; 3y baseline for SOC 2, 6y for HIPAA, 7y for SOX/PCI cardholder) |
+| Access | Engineering team broadly | Security/compliance team only; engineering on need-to-know |
+| Mutability | Sampling, redaction, downsampling allowed | Immutable; write-once storage |
+| PII | Aggressively redacted | Often must include user identity (the whole point) |
+| Volume | High | Low to moderate |
+| Schema | Structured, free-form | Strict (actor, action, resource, outcome, timestamp, request_id) |
+| Destination | Cloud Logging, CloudWatch, vendor APM | Dedicated audit log bucket, CloudTrail, SIEM |
+
+Separate the channels at emission. Two named loggers with different handlers:
+
+```python
+import logging
+
+# Operational — bridged to OTel logs, flows through gateway redaction
+operational = logging.getLogger("vqms")
+operational.info("ticket called", extra={"ticket.id": ticket_id})
+
+# Audit — direct to dedicated handler; never touches OTel redaction processor
+audit = logging.getLogger("audit")
+audit.handlers = [AuditHandler(target="audit-bucket")]   # separate stream
+audit.propagate = False                                    # do NOT bubble to root logger
+audit.info("permission_grant", extra={
+    "audit.actor.id": current_user.id,
+    "audit.action": "grant_role",
+    "audit.target.id": target_user.id,
+    "audit.role": "queue_admin",
+    "audit.outcome": "success",
+    "audit.request_id": request.id,
+})
+```
+
+The `propagate = False` is critical — without it, the audit log also goes through the operational handler, gets redacted, and you lose the user identity that makes audit logs useful in the first place.
+
+GCP-specific: enable **Cloud Audit Logs** for Admin Activity, Data Access, and System Event categories. These are managed by Google, immutable, and cover IAM and infrastructure events without application code. AWS equivalent: **CloudTrail**. Application-level audit events (business operations: "user X granted role Y") are still your responsibility.
+
+### Retention tiers and lifecycle
+
+Enterprise retention follows a hot/warm/cold/archive ladder. Keep the model explicit per log channel:
+
+| Tier | Latency to query | Cost | Typical use | Retention |
+|------|-----------------|------|------------|-----------|
+| Hot | seconds | High | Active incidents, real-time dashboards | 7-30 days |
+| Warm | seconds-minutes | Medium | Recent post-mortems, weekly reviews | 30-90 days |
+| Cold | minutes-hours | Low | Trend analysis, long-tail investigation | 90-365 days |
+| Archive | hours-days (rehydrate) | Very low | Compliance, legal hold | 1-7 years |
+
+GCP implementation:
+```bash
+# Cloud Logging bucket with explicit retention
+gcloud logging buckets update _Default \
+    --location=us-central1 \
+    --retention-days=30                                    # hot tier
+
+# Sink older logs to BigQuery (warm/cold)
+gcloud logging sinks create cold-archive \
+    bigquery.googleapis.com/projects/PROJECT/datasets/logs_archive \
+    --log-filter='severity >= "INFO"'
+
+# BigQuery dataset with table expiration for archive
+bq update --time_partitioning_expiration 31536000 PROJECT:logs_archive   # 1 year
+```
+
+AWS implementation:
+```bash
+# CloudWatch Logs retention per group
+aws logs put-retention-policy --log-group-name /aws/ecs/vqms-api --retention-in-days 30
+
+# S3 lifecycle for archive — export from CWL via subscription filter or vended logs
+aws s3api put-bucket-lifecycle-configuration --bucket vqms-logs-archive \
+    --lifecycle-configuration file://lifecycle.json
+```
+
+`lifecycle.json` rolls objects from S3 Standard → S3 Standard-IA at 30 days → Glacier at 90 days → Glacier Deep Archive at 365 days, with deletion at 7 years. Log retention is one of the largest cloud bills if not managed.
+
+### SIEM integration
+
+Security Information and Event Management tools (Splunk, Microsoft Sentinel, Google Chronicle, Datadog Cloud SIEM, Elastic Security) consume security-relevant log streams for detection and compliance. The pipeline:
+
+```
+[ App audit log ] ──→ [ Audit-only Collector pipeline ] ──→ [ SIEM ]
+                              │
+                              └─→ [ Immutable archive bucket ]
+```
+
+Most SIEMs accept syslog, JSON over HTTPS, or vendor-specific formats. The Collector handles transformation:
+
+```yaml
+# Audit-only Collector pipeline
+receivers:
+  filelog/audit:
+    include: [/var/log/vqms/audit/*.log]
+    operators:
+      - type: json_parser
+
+processors:
+  memory_limiter: { ... }
+  transform/sentinel_format:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["TimeGenerated"], time)
+          - set(attributes["EventType"], attributes["audit.action"])
+
+exporters:
+  otlphttp/sentinel:
+    endpoint: "https://${env:SENTINEL_WORKSPACE}.ods.opinsights.azure.com/api/logs"
+    headers:
+      authorization: "SharedKey ${env:SENTINEL_KEY}"
+  awss3/audit_archive:
+    s3uploader:
+      region: us-east-1
+      s3_bucket: vqms-audit-archive
+      s3_prefix: audit/
+      compression: gzip
+
+service:
+  pipelines:
+    logs/audit:
+      receivers: [filelog/audit]
+      processors: [memory_limiter, transform/sentinel_format]
+      exporters: [otlphttp/sentinel, awss3/audit_archive]      # SIEM + immutable archive
+```
+
+The `awss3/audit_archive` writes raw audit logs to immutable S3 storage with Object Lock. Even if the SIEM is compromised or misconfigured, the archive is the source of truth.
+
+### Always-on context fields (MDC baseline)
+
+Every log line — operational and audit — should carry the same set of contextual fields, set by middleware at request entry. Without this baseline, cross-service queries are impossible.
+
+Required on every log:
+
+```yaml
+trace_id: "4bf92f3577b34da6a3ce929d0e0e4736"   # from OTel span context
+span_id: "00f067aa0ba902b7"                     # from OTel span context
+service.name: "vqms-api"                        # from resource
+service.version: "1.4.7"                        # from resource
+deployment.environment.name: "production"       # from resource
+cloud.region: "us-central1"                     # from resource detector
+
+# Request-scoped (set by middleware)
+request.id: "req-7c4d-x8j2"                     # synthetic if not provided by upstream
+tenant.id: "syncobit-prod"                      # multi-tenant SaaS
+user.id: "<hashed>"                             # if authenticated; never raw email
+correlation.id: "corr-9f86d081"                 # for non-OTel cross-system tracing
+```
+
+The `correlation.id` is essential where trace context is broken — webhook retries from external systems, message queue handlers that deserialize without context propagation, scheduled jobs. It's the fallback "join key" when `trace_id` isn't reliable.
+
+Implementation pattern (Python; equivalent in Node MDC, Go context, Java MDC):
+
+```python
+from contextvars import ContextVar
+import logging
+
+_request_context: ContextVar[dict] = ContextVar("request_context", default={})
+
+class ContextFilter(logging.Filter):
+    def filter(self, record):
+        ctx = _request_context.get()
+        for k, v in ctx.items():
+            setattr(record, k, v)
+        return True
+
+# Middleware — set once per request
+def context_middleware(request, handler):
+    _request_context.set({
+        "request.id": request.id,
+        "tenant.id": request.tenant_id,
+        "user.id": hash_user_id(request.user_id) if request.user_id else None,
+        "correlation.id": request.headers.get("x-correlation-id"),
+    })
+    return handler(request)
+
+logging.getLogger().addFilter(ContextFilter())
+```
+
+Now every log emitted during the request automatically carries the context. Engineers don't have to remember to add it on every call.
+
+### Runtime log-level control
+
+"Increase the log level for service X to DEBUG for the next hour" is a common debugging request. Without a mechanism, this requires a deploy, which is slow and disruptive. Three viable mechanisms:
+
+1. **Centralized config service** — LaunchDarkly, Unleash, AWS AppConfig, GCP Runtime Config. Application polls every 30-60s for the current level.
+2. **Feature flag with TTL** — set "service-X-log-level=DEBUG" with auto-expiry at 1 hour. Removes the "we forgot to revert" risk.
+3. **Admin endpoint** — `POST /admin/log-level {level: "DEBUG", duration_seconds: 3600}` on the service itself, behind strict auth.
+
+Pattern (Python with LaunchDarkly):
+
+```python
+import logging
+import ldclient
+from ldclient.config import Config
+
+ldclient.set_config(Config(sdk_key="LD_KEY"))
+client = ldclient.get()
+
+def update_log_level():
+    level_name = client.variation("log-level-vqms-api", user, "INFO")
+    level = getattr(logging, level_name)
+    logging.getLogger().setLevel(level)
+
+# Schedule update_log_level() to run every 60s
+```
+
+Rules:
+- Always TTL the override (1 hour default; 4 hours max). DEBUG indefinitely is how PII ends up in archives.
+- Audit log every override (who, what service, what level, duration) to the audit channel.
+- Override is per-service or per-logger, never global.
+- Production override authority is restricted (security/SRE team), not engineering at large.
+
+### Log-based metrics
+
+Some signals naturally exist as logs but are queried as metrics: "rate of 5xx responses", "count of permission denials", "p99 of payment processing time per tenant". You can either:
+
+1. **Emit a metric in code** — explicit OTel counter/histogram. Cheaper to query, requires forethought.
+2. **Derive a metric from logs** — Cloud Logging log-based metrics, CloudWatch metric filters, Splunk indexed extractions. Slower, more flexible, retroactive.
+
+Use log-based metrics for *exploratory* and *unforeseen* aggregations; use code-emitted metrics for the dashboard you check daily.
+
+GCP example — log-based counter for permission denials:
+```bash
+gcloud logging metrics create permission_denials \
+    --description="Count of authorization failures" \
+    --log-filter='resource.type="cloud_run_revision"
+                  jsonPayload.audit.action="authz_denied"
+                  severity="WARNING"' \
+    --label-extractors='tenant_id=EXTRACT(jsonPayload.tenant.id),
+                        action=EXTRACT(jsonPayload.audit.action_attempted)'
+```
+
+AWS example — CloudWatch metric filter:
+```bash
+aws logs put-metric-filter \
+    --log-group-name /aws/ecs/vqms-api \
+    --filter-name PermissionDenials \
+    --filter-pattern '{ $.audit.action = "authz_denied" }' \
+    --metric-transformations \
+        metricName=PermissionDenials,metricNamespace=Vqms,metricValue=1
+```
+
+Cost note: log-based metrics scan the log stream — they are billed per GB scanned on AWS. For high-volume logs, a code-emitted metric is often cheaper.
+
+### Volume budgets and chargeback
+
+At enterprise scale, log volume becomes a financial signal. A team that emits 10x the logs of its peers is either fighting hard incidents (interesting) or has a bug (worth flagging). Budgeting per service/team:
+
+| Mechanism | How |
+|-----------|-----|
+| Per-service budget | Tag every log with `team` resource attribute; aggregate cost in vendor bill or via volume metric |
+| Soft alert | Alert team owner when their service exceeds 2x the median for the namespace |
+| Hard cap | Drop INFO logs from services above N MB/hour at the Collector |
+| Chargeback | Cost allocation by `team` tag fed to FinOps |
+
+Collector-side rate limiting:
+
+```yaml
+processors:
+  ratelimit/per_service:
+    # Hypothetical processor; in practice use sampling + alerting in vendor backend
+    rate_limit_key: service.name
+    limit_per_second: 1000
+```
+
+In practice, most teams enforce budgets via vendor billing alerts and team-level dashboards rather than hard caps — hard caps drop data right when it's most useful (during an incident).
+
+The structural fix is upstream: review log emission rates in code review. A new `log.info` inside a hot loop is a budget event.
+
 ## PII at each level
 
 The PII risk increases sharply as level decreases:
@@ -300,6 +578,15 @@ Engineer enables DEBUG to investigate an issue, forgets to revert. Logs balloon,
 - [ ] Per-environment level overrides documented
 - [ ] FATAL only used when process is exiting
 - [ ] WARN volume is low enough to be reviewable (rule of thumb: <100/hour per service)
+- [ ] Audit logs separated from operational logs (different logger, handler, destination)
+- [ ] Audit log retention meets regulatory minimum (3y SOC 2, 6y HIPAA, 7y PCI/SOX)
+- [ ] Operational log retention bounded (30d hot default for production)
+- [ ] Tier lifecycle configured (hot → warm → cold → archive)
+- [ ] SIEM pipeline for audit events with immutable archive
+- [ ] MDC baseline (trace_id, span_id, tenant.id, request.id, correlation.id) on every log
+- [ ] Runtime log-level override mechanism (with TTL and audit trail)
+- [ ] Log-based metrics chosen over code metrics only for exploratory queries
+- [ ] Per-team / per-service volume tagged for chargeback or budget alerts
 ```
 
 ## Sources

@@ -1,6 +1,6 @@
 # Composition with the API Skills
 
-How OTel observability layers on top of `api-idempotency`, `api-error-responses`, and `api-conditional-requests`. The combination produces requests that are debuggable end-to-end, with full correlation between client retries, server state changes, and observed telemetry.
+How OTel observability layers on top of `api-idempotency`, `api-error-responses`, and `api-http-caching`. The combination produces requests that are debuggable end-to-end, with full correlation between client retries, server state changes, and observed telemetry.
 
 ## The overall picture
 
@@ -9,7 +9,7 @@ The four skills cover orthogonal concerns:
 | Skill | Concern | Mechanism |
 |-------|---------|-----------|
 | `api-idempotency` | Retry safety | `Idempotency-Key` header + dedupe store |
-| `api-conditional-requests` | Concurrency control | `If-Match` + 412 |
+| `api-http-caching` | Concurrency control + cache validation | `If-Match` + 412; `If-None-Match` + 304; `Cache-Control` |
 | `api-error-responses` | Error contract | RFC 9457 Problem Details |
 | `otel-observability` (this) | Visibility into all of the above | Spans, metrics, logs with semantic attributes |
 

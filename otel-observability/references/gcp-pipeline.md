@@ -322,6 +322,288 @@ metadata:
     instrumentation.opentelemetry.io/inject-python: "vqms/vqms-instrumentation"
 ```
 
+## Gateway pattern on GCP
+
+For >50 services or any tail sampling, graduate from sidecars to a centralized gateway Collector cluster. The general production-hardening guidance lives in `collector-production.md` — this section is the GCP-specific deployment.
+
+### GKE-hosted gateway (recommended)
+
+Run the gateway as a `StatefulSet` in a dedicated `observability` namespace, with persistent volumes for the file-storage queue:
+
+```yaml
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: gateway
+  namespace: observability
+spec:
+  mode: statefulset
+  replicas: 3
+  image: us-docker.pkg.dev/cloud-ops-agents-artifacts/google-cloud-opentelemetry-collector/otelcol-google:0.121.0
+  serviceAccount: otel-gateway
+  volumeClaimTemplates:
+    - metadata: { name: queue }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: "20Gi" } }
+        storageClassName: standard-rwo
+  volumeMounts:
+    - { name: queue, mountPath: /var/lib/otelcol }
+```
+
+Apps in any GCP environment (Cloud Run, GKE, Cloud Functions, GCE) export OTLP to the gateway via internal load balancer. For Cloud Run apps reaching the gateway in GKE, use **Internal HTTP(S) Load Balancing** with VPC-direct egress so the traffic stays on the private network:
+
+```yaml
+# Cloud Run service annotations for VPC egress
+metadata:
+  annotations:
+    run.googleapis.com/vpc-access-connector: projects/PROJECT/locations/us-central1/connectors/obs-connector
+    run.googleapis.com/vpc-access-egress: private-ranges-only
+```
+
+The internal LB DNS name (`otel-gateway.observability.svc.cluster.local` from inside the cluster, or a static internal IP exposed via private DNS for cross-cluster access) becomes the OTLP endpoint for every app.
+
+### Two-tier (DaemonSet agent + StatefulSet gateway)
+
+For larger estates, agents on each GKE node forward to the gateway with the `loadbalancing` exporter:
+
+```yaml
+# Agent DaemonSet config (excerpt)
+exporters:
+  loadbalancing:
+    routing_key: traceID
+    protocol:
+      otlp:
+        tls: { insecure: false, ca_file: /etc/otelcol/ca.pem }
+    resolver:
+      k8s:
+        service: gateway-collector.observability
+        ports: [4317]
+```
+
+See `collector-production.md` for the full topology rationale, persistent queue setup, and self-telemetry SLOs.
+
+## Cloud Functions Gen 2
+
+Cloud Functions Gen 2 runs on Cloud Run under the hood — use the Cloud Run sidecar pattern from above.
+
+For Gen 1 functions (still supported for legacy code), the sidecar pattern doesn't apply (no multi-container support). Options:
+- **Direct exporter**: ship OTLP from the function code straight to your gateway. Adds cold-start cost.
+- **Cloud Trace via Google Client Library**: use `google-cloud-trace` and skip OTel entirely on Gen 1. Acceptable if you only need traces and only on GCP.
+
+Gen 2 example (Python, deployed via `gcloud functions deploy`):
+
+```python
+# main.py
+import functions_framework
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
+@functions_framework.http
+def handle(request):
+    with tracer.start_as_current_span("handle_request") as span:
+        span.set_attribute("http.method", request.method)
+        span.set_attribute("http.path", request.path)
+        # ... business logic ...
+        return "ok", 200
+```
+
+Deploy with the sidecar collector via service YAML same as Cloud Run.
+
+### Cold-start consideration
+
+Cloud Functions cold starts plus Collector sidecar startup can be 1-3s. For latency-sensitive callbacks, `min-instances: 1` keeps one warm at the cost of always-on billing.
+
+## Apigee — `X-Cloud-Trace-Context` and W3C dual propagation
+
+Apigee proxies emit traces using GCP's pre-W3C header, `X-Cloud-Trace-Context`. Modern OTel SDKs default to W3C `traceparent`. To preserve trace continuity from Apigee to backend services, register both propagators:
+
+```python
+from opentelemetry.propagate import set_global_textmap
+from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.propagators.cloud_trace_propagator import CloudTraceFormatPropagator
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.baggage.propagation import W3CBaggagePropagator
+
+set_global_textmap(CompositePropagator([
+    TraceContextTextMapPropagator(),    # W3C — for OTel-native services
+    W3CBaggagePropagator(),
+    CloudTraceFormatPropagator(),       # X-Cloud-Trace-Context — for Apigee, Cloud Run LB
+]))
+```
+
+GCP load balancers (HTTPS LB, Internal HTTPS LB) also emit `X-Cloud-Trace-Context`. Without the Cloud Trace propagator, traces appear to start at your service rather than at the LB or Apigee — losing the front-door tier from the trace.
+
+In Apigee, enable distributed tracing in the proxy configuration:
+
+```xml
+<!-- Apigee proxy config -->
+<DistributedTrace>
+    <Enabled>true</Enabled>
+    <SamplingPercentage>10</SamplingPercentage>
+</DistributedTrace>
+```
+
+Apigee shipps trace data to Cloud Trace directly (not via your Collector). Two paths into Cloud Trace — Apigee's direct ship and your Collector — appear as the same trace if `traceparent`/`X-Cloud-Trace-Context` matches.
+
+## Pub/Sub trace propagation
+
+Pub/Sub doesn't propagate trace context automatically. The pattern: encode `traceparent` as a message attribute on publish, extract on receive.
+
+### Publisher (Python)
+
+```python
+from google.cloud import pubsub_v1
+from opentelemetry import trace, propagate
+
+publisher = pubsub_v1.PublisherClient()
+topic_path = publisher.topic_path("PROJECT", "TOPIC")
+tracer = trace.get_tracer(__name__)
+
+def publish_event(payload: dict):
+    with tracer.start_as_current_span("pubsub.publish") as span:
+        span.set_attribute("messaging.system", "gcp_pubsub")
+        span.set_attribute("messaging.destination.name", topic_path)
+
+        # Encode trace context into message attributes
+        attrs = {}
+        propagate.inject(attrs)        # writes traceparent, tracestate, baggage
+
+        future = publisher.publish(
+            topic_path,
+            data=json.dumps(payload).encode(),
+            **attrs,                    # pubsub message attributes
+        )
+        message_id = future.result()
+        span.set_attribute("messaging.message.id", message_id)
+```
+
+### Subscriber (Python pull)
+
+```python
+from opentelemetry import context
+from opentelemetry.trace import SpanKind
+
+def handle_message(message: pubsub_v1.subscriber.message.Message):
+    # Extract trace context from the message attributes
+    ctx = propagate.extract(dict(message.attributes))
+
+    with tracer.start_as_current_span(
+        "pubsub.process",
+        context=ctx,
+        kind=SpanKind.CONSUMER,
+    ) as span:
+        span.set_attribute("messaging.system", "gcp_pubsub")
+        span.set_attribute("messaging.message.id", message.message_id)
+        # ... process the payload ...
+        message.ack()
+```
+
+The publisher and subscriber spans now appear in the same trace, even though they may run minutes or hours apart on different services. Without this, every subscriber starts a new trace.
+
+For high-throughput Pub/Sub, the auto-instrumentation `opentelemetry-instrumentation-google-cloud-pubsub` (community-maintained, check stability) handles this automatically.
+
+## Eventarc
+
+Eventarc routes events from various GCP sources (Pub/Sub, Cloud Storage, Audit Logs) to consumers (Cloud Run, GKE, Workflows). The trace propagation story:
+
+- For Pub/Sub-backed Eventarc events, trace context flows in message attributes — same pattern as direct Pub/Sub.
+- For CloudEvents-formatted Eventarc events, `traceparent` should be in the CloudEvents extension attributes.
+
+Verify by inspecting an actual delivered event:
+
+```python
+@functions_framework.cloud_event
+def handle_eventarc(event):
+    # CloudEvent extensions include traceparent if upstream set it
+    traceparent = event.get("traceparent")
+    ctx = propagate.extract({"traceparent": traceparent}) if traceparent else None
+    with tracer.start_as_current_span("eventarc.handle", context=ctx) as span:
+        span.set_attribute("ce.type", event["type"])
+        span.set_attribute("ce.source", event["source"])
+        # ... handle event ...
+```
+
+If your Eventarc events lack `traceparent`, the upstream emitter isn't propagating — fix at the source, or accept that Eventarc starts a new trace.
+
+## Cloud Workflows
+
+Cloud Workflows orchestrates a series of steps across services. Tracing across workflow steps requires propagating `traceparent` in each HTTP call:
+
+```yaml
+# workflow.yaml
+main:
+  params: [event]
+  steps:
+    - init:
+        assign:
+          - traceparent: ${event.headers["traceparent"]}
+    - call_service_a:
+        call: http.post
+        args:
+          url: https://service-a.run.app/process
+          headers:
+            traceparent: ${traceparent}
+            x-workflow-execution: ${sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          body: ${event.body}
+        result: result_a
+    - call_service_b:
+        call: http.post
+        args:
+          url: https://service-b.run.app/process
+          headers:
+            traceparent: ${traceparent}
+          body: ${result_a.body}
+```
+
+The workflow step itself doesn't currently auto-emit OTel spans (as of May 2026). Workaround: a thin "workflow tracer" Cloud Function called by each step that creates a span representing the step. Enrich with `gcp.workflow.execution_id`, `gcp.workflow.step.name` attributes.
+
+Cloud Workflows' execution logs are in Cloud Logging — correlate via `executions.googleapis.com%2Fexecutions/<id>` resource label.
+
+## Private networking — VPC-SC and Private Google Access
+
+Production GCP workloads usually run in private VPCs without public IPs. The observability pipeline must work over the private network:
+
+### Private Google Access for Collector → Cloud Trace/Logging/Monitoring
+
+Enable Private Google Access on the subnet where Collectors run. Cloud Trace, Cloud Logging, Cloud Monitoring APIs resolve to private IPs (`private.googleapis.com` / `restricted.googleapis.com`). No public egress.
+
+```bash
+gcloud compute networks subnets update obs-subnet \
+    --region=us-central1 \
+    --enable-private-ip-google-access
+```
+
+For VPC-SC perimeters, use `restricted.googleapis.com` (only services protected by your perimeter) instead of `private.googleapis.com` (all GCP services).
+
+### Cloud Run / Cloud Functions VPC egress
+
+Apps in Cloud Run that need to reach a GKE-hosted gateway use a Serverless VPC Access connector:
+
+```bash
+gcloud compute networks vpc-access connectors create obs-connector \
+    --region=us-central1 \
+    --network=vpc-prod \
+    --range=10.8.0.0/28
+```
+
+Cloud Run service annotation:
+```yaml
+run.googleapis.com/vpc-access-connector: projects/PROJECT/locations/us-central1/connectors/obs-connector
+run.googleapis.com/vpc-access-egress: private-ranges-only
+```
+
+Now the Cloud Run service can reach the GKE gateway via its internal load balancer IP, and to GCP APIs via Private Google Access.
+
+For VPC Service Controls setup (perimeter creation, telemetry API restriction), see `security-and-compliance.md`.
+
 ## Mapping OTel signals to GCP backends
 
 | OTel signal | Default GCP backend | Alternative |

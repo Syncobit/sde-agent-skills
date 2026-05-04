@@ -1,6 +1,6 @@
 ---
 name: otel-observability
-description: Apply OpenTelemetry (OTel) for traces, metrics, and logs when designing or reviewing service observability. Use this skill whenever the task involves instrumenting an application, configuring exporters or collectors, deploying observability infrastructure on Google Cloud (Cloud Run, GKE) or AWS (ECS, EKS, Lambda), debugging missing or broken telemetry, choosing sampling strategies, defining resource attributes or semantic conventions, correlating traces with logs and metrics, or designing the boundary between vendor-neutral instrumentation and vendor-specific backends. Trigger broadly — observability questions, "why don't I see my traces in Cloud Trace", missing X-Ray segments, sampling cost concerns, "how do I add metrics to this Cloud Run service", and any review of a service's telemetry pipeline should use this skill, even when the user does not say "OpenTelemetry". Composes with the API skills (api-idempotency, api-error-responses, api-conditional-requests) for end-to-end request correlation.
+description: Apply OpenTelemetry (OTel) for traces, metrics, and logs across backend and edge tiers. Use when instrumenting apps, configuring exporters or Collectors, deploying on GCP (Cloud Run, GKE, Cloud Functions, Apigee), AWS (ECS, EKS, Lambda, API Gateway, Step Functions, EventBridge), edge runtimes (Cloudflare Workers, Vercel Edge, Lambda@Edge), or browsers (RUM); debugging missing or broken telemetry; sampling and cardinality; semantic conventions; log levels and audit-vs-operational channels; production-hardening the Collector; routing to non-cloud backends (Datadog, Splunk, New Relic, Grafana Cloud, Honeycomb); multi-tenant isolation; or migrating from X-Ray, Jaeger, Zipkin, StatsD, Prometheus, or Datadog APM. Trigger broadly on missing traces, missing X-Ray segments, sampling cost, RUM correlation, logs-to-traces joins, PII-in-traces reviews, CI testing of instrumentation, even when the user does not say OpenTelemetry. Composes with api-idempotency, api-error-responses, api-http-caching.
 ---
 
 # OpenTelemetry Observability
@@ -55,6 +55,19 @@ The Collector is a separate process (sidecar, daemonset, or standalone deploymen
 **Recommendation for Syncobit**: Pattern B (Collector) for everything except very simple single-cloud, single-language services. The Collector pays for itself the first time you need to redact PII, change sampling, or dual-export during a cloud migration.
 
 For the GCP-specific Collector deployment patterns (Cloud Run sidecar, GKE operator), see `references/gcp-pipeline.md`. For AWS, see `references/aws-pipeline.md`.
+
+### Topology — sidecar, agent, gateway, or two-tier
+
+Once you've picked Pattern B (Collector), the next decision is *where* the Collector runs. Four canonical patterns:
+
+| Topology | Where | When |
+|----------|-------|------|
+| **Sidecar** | One Collector per app instance (same pod / task) | Cloud Run, ECS Fargate, small K8s estates (<50 services) |
+| **Agent (DaemonSet)** | One per K8s node | Medium-scale K8s — shared per-node Collector reduces overhead |
+| **Gateway** | Centralized Collector cluster behind a load balancer | >50 services, OR any tail sampling at scale |
+| **Two-tier (agent + gateway)** | DaemonSet agent does cheap work; forwards to gateway cluster for sampling, redaction, fan-out | Enterprise default — best resilience and operational control |
+
+Sidecar is the simplest and the right starting point. Graduate to gateway when any of these become true: tail sampling at scale (requires all spans of a trace at the same Collector), >50 services (sidecar memory cost = N × 256Mi), centralized redaction/PII compliance (auditable in one place), or multi-vendor fan-out (sending to two backends from every sidecar wastes work). For the full topology comparison, persistent-queue setup, `loadbalancing` exporter, and self-telemetry SLOs, see `references/collector-production.md`.
 
 ## Step 2 — Choose signals and stability posture
 
@@ -185,15 +198,29 @@ Once instrumentation is in place and the Collector is deployed, the last step is
 
 Full configuration in `references/gcp-pipeline.md`.
 
-**For AWS** (ECS, EKS, Lambda):
+**For AWS** (ECS, EKS, Lambda, API Gateway, Step Functions, EventBridge):
 - Use AWS Distro for OpenTelemetry (ADOT) Collector — AWS-curated build with AWS exporters and resource detectors
 - ECS: ADOT as a sidecar container in the task definition
 - EKS: ADOT via the OpenTelemetry Operator (similar to GKE)
 - Lambda: ADOT as a Lambda Layer (special case, cold-start sensitive)
+- API Gateway, AppSync, Step Functions: native X-Ray + W3C dual propagation in downstream services
+- Pub/Sub-style: encode `traceparent` in EventBridge/SNS/SQS message attributes
 - Backends: X-Ray (traces), CloudWatch Metrics, CloudWatch Logs
 - IAM: task role / instance role needs `AWSXRayDaemonWriteAccess` plus CloudWatch permissions
 
 Full configuration in `references/aws-pipeline.md`.
+
+**For non-cloud backends** (Datadog, Splunk Observability Cloud, New Relic, Grafana Cloud, Honeycomb, Dynatrace, Elastic):
+- All accept OTLP natively — apps stay vendor-neutral, Collector exports per-vendor
+- Per-vendor authentication, regional endpoints, payload limits in `references/non-cloud-backends.md`
+- Cost-tier routing (errors and slow traces → expensive vendor; bulk → cheap backend) is a one-processor change
+
+**For edge and RUM** (Cloudflare Workers, Vercel Edge, Lambda@Edge, browser):
+- Edge runtimes use vendor-specific OTel SDKs (`@microlabs/otel-cf-workers`, `@vercel/otel`)
+- Browser SDK propagates `traceparent` to first-party origins (CORS must allow it)
+- Browsers ship through your gateway Collector — never expose vendor API keys to client code
+- CDN logs (Cloudflare Logpush, CloudFront real-time, Cloud CDN) materialized as spans for end-to-end visibility
+- Full configuration in `references/edge-and-rum.md`
 
 ## Step 7 — Compose with the API skills
 
@@ -204,7 +231,7 @@ OTel is the substrate other observability concerns sit on top of. It composes na
 | Trace context across services | W3C `traceparent` / `tracestate` headers (propagators) | this one |
 | Request correlation in error responses | `request_id` in Problem Details, set from current trace's `span_id` | `api-error-responses` + this |
 | Idempotency-Key tracing | Set `idempotency.key` as a span attribute on the dedupe lookup | `api-idempotency` + this |
-| ETag mismatch debugging | Set `http.if_match.matched` (boolean) and `http.etag.current` as span attributes on 412 responses | `api-conditional-requests` + this |
+| ETag mismatch debugging | Set `http.if_match.matched` (boolean) and `http.etag.current` as span attributes on 412 responses | `api-http-caching` + this |
 
 The integration point is **span attributes**. Every API skill's mechanisms become observable when you record their outcomes as attributes on the relevant span. A 412 with `http.if_match.matched=false, http.etag.expected="v17", http.etag.actual="v18"` is debuggable. A 412 without those attributes is a mystery in the logs.
 
@@ -224,11 +251,29 @@ Cite primary sources: OpenTelemetry specification at opentelemetry.io/docs/specs
 
 ## When to dig into the references
 
+**Instrumentation and signal mechanics**
 - **Per-language SDK setup, auto-instrumentation, manual spans, log bridging** → `references/instrumentation-polyglot.md`
-- **Choosing log levels correctly (INFO vs WARN vs ERROR), structured logging, anti-patterns** → `references/log-levels.md`
-- **GCP pipeline (Cloud Run sidecar, GKE operator, Google-Built Collector, IAM, exporters)** → `references/gcp-pipeline.md`
-- **AWS pipeline (ADOT Collector, ECS/EKS/Lambda patterns, X-Ray, CloudWatch)** → `references/aws-pipeline.md`
-- **Sampling strategies and cardinality control** → `references/sampling-and-cost.md`
-- **Resource attributes and semantic conventions** → `references/semantic-conventions.md`
-- **Common observability bugs and review checklist** → `references/anti-patterns.md`
-- **Composing with idempotency, ETag, and Problem Details** → `references/composition.md`
+- **Edge runtimes (Cloudflare Workers, Vercel Edge, Lambda@Edge), browser SDK, RUM, CDN log correlation** → `references/edge-and-rum.md`
+- **Resource attributes, OTel semantic conventions, Weaver, custom-attribute namespacing** → `references/semantic-conventions.md`
+- **Sampling strategies (head, tail, per-tenant), cardinality control, cost math** → `references/sampling-and-cost.md`
+
+**Logging at enterprise scale**
+- **Choosing log levels (INFO vs WARN vs ERROR), span-vs-log discipline, structured logging, audit-vs-operational channels, retention tiers, SIEM integration, MDC baseline, runtime level control, volume budgets** → `references/log-levels.md`
+
+**Cloud and backend pipelines**
+- **GCP pipeline — Cloud Run sidecar, GKE Operator, gateway pattern, Cloud Functions Gen 2, Apigee, Pub/Sub propagation, Eventarc, Workflows, VPC-SC private networking** → `references/gcp-pipeline.md`
+- **AWS pipeline — ADOT, ECS/EKS/Lambda, gateway pattern, API Gateway, AppSync, Step Functions, EventBridge/SNS/SQS propagation, PrivateLink** → `references/aws-pipeline.md`
+- **Non-cloud OTLP backends — Datadog, Splunk Observability Cloud, New Relic, Grafana Cloud (Tempo/Mimir/Loki), Honeycomb, Dynatrace, Elastic** → `references/non-cloud-backends.md`
+
+**Production hardening**
+- **Collector production — memory_limiter, persistent queue, gateway pattern, loadbalancingexporter, BatchSpanProcessor tuning, retry/backoff, OTLP transport, self-telemetry SLOs, capacity planning** → `references/collector-production.md`
+- **Security and compliance — mTLS / OIDC on receivers, redaction processor, attribute hashing, CMEK / KMS, VPC Service Controls / PrivateLink, data residency, audit-log channel separation, PCI/HIPAA/SOC 2/GDPR posture, right-to-be-forgotten** → `references/security-and-compliance.md`
+- **Multi-tenancy — tenant.id propagation, isolation models, per-tenant sampling, chargeback / cost attribution, per-tenant retention, tenant deletion** → `references/multi-tenancy.md`
+
+**Migration and validation**
+- **Migrating from X-Ray SDK / Jaeger / Zipkin / StatsD / Prometheus / Datadog APM / log shippers — coexistence patterns, ID compatibility, parallel-running validation, decommissioning** → `references/migration.md`
+- **Testing instrumentation — InMemorySpanExporter, snapshot tests, propagation tests, otelcol validate, Weaver schema check, PII scanning in CI** → `references/testing-and-ci.md`
+
+**Reviews and composition**
+- **Common observability bugs and review checklist (22 anti-patterns, severity-tagged)** → `references/anti-patterns.md`
+- **Composing with idempotency, ETag, and Problem Details — span attributes that bridge the API skills** → `references/composition.md`

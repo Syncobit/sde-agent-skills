@@ -318,6 +318,374 @@ Cold start cost: ADOT layer adds ~1-3 seconds to cold starts. For latency-sensit
 
 For high-throughput Lambdas, ADOT's overhead amortizes to nothing once warm. For low-throughput, latency-sensitive Lambdas, weigh the cold-start tax against the value of unified observability.
 
+## Gateway pattern on AWS
+
+For >50 services or any tail sampling, run a centralized ADOT gateway cluster instead of per-task sidecars. General hardening lives in `collector-production.md`; this section is the AWS-specific deployment.
+
+### EKS-hosted gateway
+
+```yaml
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: gateway
+  namespace: observability
+spec:
+  mode: statefulset
+  replicas: 3
+  image: public.ecr.aws/aws-observability/aws-otel-collector:v0.42.0
+  serviceAccount: adot-gateway
+  volumeClaimTemplates:
+    - metadata: { name: queue }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: "20Gi" } }
+        storageClassName: gp3
+  volumeMounts:
+    - { name: queue, mountPath: /var/lib/otelcol }
+```
+
+Expose via an internal Network Load Balancer (NLB):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-collector
+  namespace: observability
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+spec:
+  type: LoadBalancer
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: 4317 }
+    - { name: otlp-http, port: 4318, targetPort: 4318 }
+  selector:
+    app.kubernetes.io/name: gateway-collector
+```
+
+Apps in ECS, Lambda, EC2, and other VPCs reach the gateway via the NLB's internal DNS. For cross-account or cross-VPC access, expose the NLB via PrivateLink (see "Private networking" below).
+
+### Two-tier (DaemonSet agent + StatefulSet gateway)
+
+For ECS, the equivalent is the sidecar-tier ADOT pointing to the gateway with `loadbalancing` exporter and `routing_key: traceID`. See `collector-production.md` for the routing rationale and full config.
+
+For EKS:
+
+```yaml
+# Agent DaemonSet
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: agent
+  namespace: observability
+spec:
+  mode: daemonset
+  image: public.ecr.aws/aws-observability/aws-otel-collector:v0.42.0
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc: { endpoint: 0.0.0.0:4317 }
+          http: { endpoint: 0.0.0.0:4318 }
+    processors:
+      memory_limiter: { check_interval: 1s, limit_mib: 800, spike_limit_mib: 200 }
+      k8sattributes: { auth_type: serviceAccount }
+      resourcedetection: { detectors: [env, eks, ec2] }
+      batch: { timeout: 5s }
+    exporters:
+      loadbalancing:
+        routing_key: traceID
+        protocol:
+          otlp:
+            tls: { insecure: false }
+            sending_queue: { enabled: true, queue_size: 5000 }
+        resolver:
+          k8s:
+            service: gateway-collector.observability
+            ports: [4317]
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resourcedetection, batch]
+          exporters: [loadbalancing]
+```
+
+Apps target the node IP via Downward API (per `gcp-pipeline.md` GKE example); the agent forwards trace-routed traffic to the gateway pool.
+
+## API Gateway
+
+API Gateway (REST and HTTP APIs) supports X-Ray tracing natively. Enable per-stage:
+
+```bash
+aws apigateway update-stage \
+    --rest-api-id $API_ID \
+    --stage-name prod \
+    --patch-operations op=replace,path=/tracingEnabled,value=true
+```
+
+API Gateway emits an X-Ray segment per request. Downstream Lambda integrations propagate via `X-Amzn-Trace-Id`. To see API Gateway segments alongside OTel spans from your services:
+
+1. Configure your service SDKs with the X-Ray ID generator and propagator (see "X-Ray trace context — the propagator gotcha" above)
+2. Ship X-Ray segments and OTel spans to a backend that accepts both (X-Ray itself, or an OTLP backend via the AWS X-Ray exporter in the Collector)
+
+For HTTP APIs, native X-Ray support is more limited. Use Lambda authorizer / proxy integration to inject `traceparent` headers in addition to `X-Amzn-Trace-Id`:
+
+```python
+# Custom Lambda authorizer
+def lambda_handler(event, context):
+    # X-Amzn-Trace-Id is set by API Gateway
+    trace_id_header = event["headers"].get("x-amzn-trace-id", "")
+    # Convert to W3C traceparent for downstream OTel services
+    # Format: Root=1-5e988ba5-deadbeef → 4bf92f3577b34da6deadbeef00000000
+    w3c_trace_id = parse_xray_to_w3c(trace_id_header)
+    event["headers"]["traceparent"] = f"00-{w3c_trace_id}-...-01"
+    return event
+```
+
+In practice the cleaner pattern is a single OTel SDK with both propagators registered (W3C + X-Ray), no header rewriting.
+
+### Custom domain and access logs
+
+API Gateway access logs can be JSON-formatted with `$context.xrayTraceId` — pipe to CloudWatch Logs and pick up via Log subscription → Lambda → OTLP gateway to materialize as spans (similar to the CloudFront pattern in `edge-and-rum.md`).
+
+## AppSync (GraphQL)
+
+AppSync supports X-Ray tracing for resolvers. Enable per-API:
+
+```bash
+aws appsync update-graphql-api \
+    --api-id $API_ID \
+    --xray-enabled \
+    --name "vqms-graphql"
+```
+
+Each resolver invocation emits an X-Ray subsegment. Combined with `X-Amzn-Trace-Id` propagation to downstream Lambda/RDS/ES integrations, traces span the full GraphQL request.
+
+For OTel correlation, register the X-Ray propagator in your Lambda resolvers and your downstream services. AppSync resolver spans appear as siblings of your OTel-instrumented spans in the same trace.
+
+## Step Functions
+
+Step Functions integrates with X-Ray when tracing is enabled at the state machine level:
+
+```json
+{
+  "stateMachineArn": "arn:aws:states:...",
+  "tracingConfiguration": { "enabled": true }
+}
+```
+
+Each execution becomes an X-Ray trace; each state becomes a subsegment. Tasks invoking Lambda, ECS, etc. propagate `X-Amzn-Trace-Id` automatically.
+
+For OTel-instrumented downstream services, register both W3C and X-Ray propagators so Step Functions traces extend through. The X-Ray subsegment for the state appears as the parent of your OTel span.
+
+Custom states that call external HTTP services (HTTP Tasks, third-party APIs): inject `traceparent` explicitly via the state's parameter mapping:
+
+```json
+{
+  "Type": "Task",
+  "Resource": "arn:aws:states:::http:invoke",
+  "Parameters": {
+    "ApiEndpoint": "https://api.partner.com/v1/notify",
+    "Method": "POST",
+    "Headers": {
+      "traceparent.$": "$.traceparent"
+    }
+  }
+}
+```
+
+The `$.traceparent` variable comes from a prior state that built it from the execution's X-Ray context.
+
+## EventBridge
+
+EventBridge does not propagate trace context by default. Pattern: include `traceparent` in the event detail or in CloudEvents-format extensions, extract on the consumer side.
+
+### Publishing
+
+```python
+import boto3
+from opentelemetry import trace, propagate
+
+eventbridge = boto3.client("events")
+tracer = trace.get_tracer(__name__)
+
+def publish_order_created(order):
+    with tracer.start_as_current_span("eventbridge.publish") as span:
+        span.set_attribute("messaging.system", "aws_eventbridge")
+        span.set_attribute("messaging.destination.name", "vqms-events")
+
+        # Inject trace context into the event detail
+        trace_carrier = {}
+        propagate.inject(trace_carrier)
+
+        eventbridge.put_events(Entries=[{
+            "Source": "vqms.api",
+            "DetailType": "OrderCreated",
+            "Detail": json.dumps({
+                "_trace": trace_carrier,        # convention: nest under _trace
+                "order": order.to_dict(),
+            }),
+            "EventBusName": "vqms-events",
+        }])
+```
+
+### Consuming (Lambda target)
+
+```python
+def handler(event, context):
+    # EventBridge wraps the original detail; extract trace context from it
+    detail = event["detail"]
+    trace_carrier = detail.get("_trace", {})
+    parent_ctx = propagate.extract(trace_carrier)
+
+    with tracer.start_as_current_span(
+        "eventbridge.consume",
+        context=parent_ctx,
+        kind=SpanKind.CONSUMER,
+    ) as span:
+        span.set_attribute("messaging.message.id", event["id"])
+        # ... process the event ...
+```
+
+The `_trace` key is a convention — choose what fits your event schema, but be consistent across all event publishers.
+
+## SNS and SQS
+
+### SNS
+
+Publish with message attributes carrying trace context:
+
+```python
+sns.publish(
+    TopicArn=topic_arn,
+    Message=json.dumps(payload),
+    MessageAttributes={
+        "traceparent": {"DataType": "String", "StringValue": current_traceparent()},
+        "tracestate":  {"DataType": "String", "StringValue": current_tracestate()},
+    },
+)
+```
+
+The OTel auto-instrumentation packages for boto3 (`opentelemetry-instrumentation-botocore`) handle this automatically — the package injects `AWSTraceHeader` and propagates AWS X-Ray trace context. For W3C, add it explicitly.
+
+### SQS
+
+Receive and extract:
+
+```python
+def process_messages(messages):
+    for msg in messages:
+        attrs = {k: v["StringValue"] for k, v in msg["MessageAttributes"].items()}
+        ctx = propagate.extract(attrs)
+        with tracer.start_as_current_span(
+            "sqs.process",
+            context=ctx,
+            kind=SpanKind.CONSUMER,
+        ) as span:
+            span.set_attribute("messaging.system", "aws_sqs")
+            span.set_attribute("messaging.message.id", msg["MessageId"])
+            # ... process body ...
+```
+
+### Lambda + SQS event source mapping
+
+When SQS triggers Lambda directly (event source mapping), Lambda's runtime extracts `AWSTraceHeader` automatically. To preserve W3C `traceparent` on this path, use the OTel propagator that handles both, and ensure `traceparent` was set as a message attribute when publishing.
+
+## SNS → SQS fan-out
+
+SNS to SQS subscription: SNS includes the original `MessageAttributes` in the SQS message body if you enable raw message delivery. Otherwise, attributes are nested under the SNS envelope:
+
+```json
+// SQS message body when raw delivery is OFF
+{
+  "Type": "Notification",
+  "MessageId": "...",
+  "TopicArn": "...",
+  "Message": "...original payload...",
+  "MessageAttributes": {
+    "traceparent": { "Type": "String", "Value": "00-..." }
+  }
+}
+```
+
+Enable raw message delivery on the subscription so `MessageAttributes` appear at the top level of the SQS message — simpler trace context extraction:
+
+```bash
+aws sns set-subscription-attributes \
+    --subscription-arn $SUB_ARN \
+    --attribute-name RawMessageDelivery \
+    --attribute-value true
+```
+
+## Private networking — VPC endpoints (PrivateLink)
+
+Production AWS workloads usually run in private subnets. Telemetry must route over the private network. Interface VPC endpoints for X-Ray, CloudWatch, and CloudWatch Logs:
+
+```bash
+aws ec2 create-vpc-endpoint \
+    --vpc-id vpc-xxx \
+    --service-name com.amazonaws.us-east-1.xray \
+    --vpc-endpoint-type Interface \
+    --subnet-ids subnet-aaa subnet-bbb \
+    --security-group-ids sg-otel-endpoints \
+    --private-dns-enabled
+
+aws ec2 create-vpc-endpoint \
+    --vpc-id vpc-xxx \
+    --service-name com.amazonaws.us-east-1.logs \
+    --vpc-endpoint-type Interface \
+    --subnet-ids subnet-aaa subnet-bbb \
+    --security-group-ids sg-otel-endpoints \
+    --private-dns-enabled
+
+aws ec2 create-vpc-endpoint \
+    --vpc-id vpc-xxx \
+    --service-name com.amazonaws.us-east-1.monitoring \
+    --vpc-endpoint-type Interface \
+    --subnet-ids subnet-aaa subnet-bbb \
+    --security-group-ids sg-otel-endpoints \
+    --private-dns-enabled
+```
+
+The security group `sg-otel-endpoints` should accept traffic on 443 only from the security group used by the Collectors. Combined with private subnets and no NAT, telemetry never crosses the public internet.
+
+### Cross-account / cross-VPC gateway access
+
+To let workloads in account B reach a gateway Collector in account A's VPC:
+
+```bash
+# Account A — expose the gateway's NLB via PrivateLink
+aws ec2 create-vpc-endpoint-service-configuration \
+    --network-load-balancer-arns $NLB_ARN \
+    --acceptance-required
+
+# Get the service name
+aws ec2 describe-vpc-endpoint-service-configurations \
+    --query 'ServiceConfigurations[0].ServiceName' --output text
+# → "com.amazonaws.vpce.us-east-1.vpce-svc-0123456789abcdef0"
+
+# Account A — allow account B
+aws ec2 modify-vpc-endpoint-service-permissions \
+    --service-id $SERVICE_ID \
+    --add-allowed-principals arn:aws:iam::ACCOUNT_B:root
+
+# Account B — create the endpoint that connects to account A's service
+aws ec2 create-vpc-endpoint \
+    --vpc-id vpc-yyy \
+    --service-name com.amazonaws.vpce.us-east-1.vpce-svc-0123456789abcdef0 \
+    --vpc-endpoint-type Interface \
+    --subnet-ids subnet-ccc subnet-ddd \
+    --security-group-ids sg-otel-client
+```
+
+Account B's apps OTLP-export to the endpoint's DNS name; PrivateLink tunnels traffic to account A's NLB → gateway. No internet, no cross-account VPC peering.
+
+For VPC endpoint policies (limiting which IAM principals can use the endpoint) and PrivateLink ingress ACLs, see `security-and-compliance.md`.
+
 ## Common pitfalls on AWS
 
 **X-Ray trace IDs incompatible with W3C tools.** X-Ray IDs encode a timestamp in the high bits. Tools that assume W3C random IDs (e.g., trace ID generators in tests, third-party tracing UIs) may reject them. If your traces span both AWS-managed services and external systems, accept this and configure tools to handle X-Ray IDs.
