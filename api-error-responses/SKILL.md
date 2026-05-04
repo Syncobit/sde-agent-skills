@@ -1,6 +1,6 @@
 ---
 name: api-error-responses
-description: Design, review, or document HTTP API error responses. Use this skill whenever the task involves designing error contracts for a REST API, picking a status code (4xx vs 5xx), writing OpenAPI error schemas, building exception handlers or middleware that translate exceptions into HTTP responses, returning validation errors from a form or request body, choosing between Problem Details (RFC 9457) / JSON:API / Google's google.rpc.Status / a custom shape, drafting error documentation, or reviewing existing error responses for consistency. Trigger broadly — any conversation about API errors, validation feedback, error codes, error envelopes, status code selection, or "how should the server tell the client what went wrong" should use this skill, even when the user does not say "error format". Composes with api-idempotency (for idempotency-specific error types) and any conditional-request work.
+description: Design, review, or document HTTP API error responses. Use this skill whenever the task involves designing error contracts for a REST API, picking a status code (4xx vs 5xx), writing OpenAPI error schemas, building exception handlers or middleware that translate exceptions into HTTP responses, returning validation errors from a form or request body, choosing between Problem Details (RFC 9457) / JSON:API / Google's google.rpc.Status / a custom shape, drafting error documentation, or reviewing existing error responses for consistency. Trigger broadly — any conversation about API errors, validation feedback, error codes, error envelopes, status code selection, or "how should the server tell the client what went wrong" should use this skill, even when the user does not say "error format". Composes with api-idempotency (for idempotency-specific error types) and api-http-caching (for 412 Precondition Failed and 428 Precondition Required around `If-Match` / `If-None-Match`).
 ---
 
 # REST API Error Response Design
@@ -224,7 +224,7 @@ Error responses don't exist in isolation. A few common compositions worth gettin
 
 - **With idempotency** (`api-idempotency` skill): define problem types `idempotency-key-missing` (400), `idempotency-key-in-flight` (409), `idempotency-key-mismatch` (422).
 - **With rate limiting**: 429 response includes `Retry-After` header AND a Problem Details body with `type: rate-limit-exceeded` and extension fields for `limit`, `remaining`, `reset`.
-- **With conditional requests**: 412 Precondition Failed for `If-Match` mismatch, 428 Precondition Required if you require `If-Match` and didn't get one.
+- **With conditional requests** (`api-http-caching` skill): 412 Precondition Failed for `If-Match` mismatch, 428 Precondition Required if you require `If-Match` and didn't get one.
 - **With async / long-running operations**: errors during the polled operation status response should follow the same format as synchronous errors — don't invent a separate shape for "the operation failed".
 
 ## Output style

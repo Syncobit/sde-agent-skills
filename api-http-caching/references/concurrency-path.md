@@ -1,6 +1,6 @@
-# Concurrency Control — If-Match, 412, 428, Lost-Update Prevention
+# API Concurrency Path — If-Match, 412, 428, Lost-Update Prevention
 
-The full design for using conditional requests as a correctness mechanism. This is the PUT/PATCH/DELETE side; the GET side is in `caching-flow.md`.
+The full design for using HTTP conditional requests as a correctness mechanism on state-changing endpoints. This is the PUT/PATCH/DELETE side of the caching surface; for GET-side cache validation, see `revalidation-flow.md`; for CDN edge caching, see `edge-caching-path.md`.
 
 ## The lost-update problem, precisely
 
@@ -21,7 +21,7 @@ GET /v1/orders/ord-123 HTTP/1.1
 
 HTTP/1.1 200 OK
 ETag: "v17"
-Cache-Control: no-cache
+Cache-Control: private, no-cache
 Content-Type: application/json
 
 {"id": "ord-123", "status": "ready", "items": [...], ...}
@@ -72,7 +72,7 @@ The conditional check and the actual write must be a single atomic operation. If
 
 Two implementation patterns:
 
-**1. Database-level optimistic concurrency**
+**1. Database-level optimistic concurrency** (recommended when DB supports it):
 
 ```sql
 UPDATE orders
@@ -99,13 +99,13 @@ def update_order(id, patch, expected_version):
     return row.version
 ```
 
-**2. Application-level locking** (when DB doesn't support compare-and-swap on the relevant fields)
+**2. Application-level locking** (when DB doesn't support compare-and-swap on the relevant fields):
 
 Acquire a per-resource lock (Redis SET NX, advisory lock in Postgres, etc.), validate the ETag, write, release. Slower but more flexible. Avoid if the DB option works.
 
 ### Distinguishing 412 from 404
 
-If the resource doesn't exist at all, return 404 — not 412. RFC 9110 §13.1.1: `If-Match` with a missing resource is a precondition failure, BUT if the request would otherwise be a 404, the 404 takes precedence. Translation: don't tell clients "your version is wrong" when actually the resource is gone.
+If the resource doesn't exist at all, return 404 — not 412. RFC 9110 §13.1.1 specifies that `If-Match` with a missing resource is a precondition failure, BUT if the request would otherwise be a 404, the 404 takes precedence. Translation: don't tell clients "your version is wrong" when actually the resource is gone.
 
 A common bug: returning 412 for both "version mismatch" and "resource deleted". The client retries against a phantom resource and confuses itself.
 
@@ -162,15 +162,15 @@ ETag: "v17"
 ```
 
 Useful when:
-- The client generates the resource ID (UUID, or external reference like an order number from another system).
-- You want create-only semantics, not create-or-update — accidentally re-creating an existing order is a bug.
-- You want HTTP-level atomicity rather than relying on a uniqueness constraint that surfaces a confusing 500 from a constraint violation.
+- The client generates the resource ID (UUID, or external reference like an order number from another system)
+- You want create-only semantics, not create-or-update — accidentally re-creating an existing order is a bug
+- You want HTTP-level atomicity rather than relying on a uniqueness constraint that surfaces a confusing 500 from a constraint violation
 
 The wildcard `*` matches "any current representation" — the precondition fails if anything exists at the URL.
 
 ## End-to-end pattern: queue ticket state machine
 
-Worked example combining everything. A virtual queue management system where multiple terminals (mobile apps, kiosks, staff dashboards) can transition the same queue ticket. State machine:
+A virtual queue management system where multiple terminals (mobile apps, kiosks, staff dashboards) can transition the same queue ticket. State machine:
 
 ```
 issued → called → serving → completed
@@ -251,7 +251,7 @@ The 412 vs 409 distinction matters: 412 is specifically "the version you specifi
 
 **3. Not handling the deleted-resource case.** If the resource was deleted between the client's GET and PATCH, the `If-Match` header points to a nonexistent ETag. Return 404, not 412.
 
-**4. Strong vs weak ETag confusion.** `If-Match` requires strong comparison. If your ETags are weak, every write fails. Audit your ETag generation; don't mix weak and strong on the same resource.
+**4. Strong vs weak ETag confusion.** `If-Match` requires strong comparison. If your ETags are weak, every write fails. Audit your ETag generation; don't mix weak and strong on the same resource. See `primitives.md` for the rules.
 
 **5. ETag-and-write not being atomic.** Read the ETag, write the resource — between those operations, another client can write. Use a database-level compare-and-swap or distributed lock; never read-then-write with `If-Match` validation in application code alone.
 

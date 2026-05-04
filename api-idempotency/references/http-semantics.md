@@ -21,6 +21,8 @@ Two consequences:
 
 ## Conditional requests (the other idempotency tool)
 
+For the full mechanics of ETag generation, conditional headers, optimistic concurrency, and revalidation flows, see the `api-http-caching` skill — it owns this material end-to-end. The summary below is just enough context to choose between the Idempotency-Key pattern and the conditional-request pattern.
+
 Sometimes the right answer is not Idempotency-Key but conditional requests with `ETag`/`If-Match`. Use this when:
 
 - The endpoint is a PUT or PATCH against a known resource.

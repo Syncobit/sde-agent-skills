@@ -1,4 +1,4 @@
-# api-engineering-agent-skills
+# sde-agent-skills
 
 Production-grade [Agent Skills](https://agentskills.io/) for designing and reviewing REST APIs. Each skill packages opinionated guidance, real worked examples, and review checklists grounded in current IETF standards (RFC 9110, 9457, draft-ietf-httpapi-idempotency-key-header-07).
 
@@ -10,6 +10,8 @@ These skills are written to the open Agent Skills standard and work with any com
 |-------|--------------|
 | [`api-idempotency`](./api-idempotency/) | Apply idempotency patterns when designing or reviewing REST endpoints, webhooks, and any operation with side effects. Covers Idempotency-Key headers, natural-key dedupe, storage schemas, concurrency handling, and a 16-item anti-pattern catalog. |
 | [`api-error-responses`](./api-error-responses/) | Design HTTP error responses across the four major formats (RFC 9457 Problem Details, JSON:API, `google.rpc.Status`, custom). Covers status code selection, validation errors, security, and OpenAPI integration. |
+| [`api-http-caching`](./api-http-caching/) | Design HTTP caching and conditional requests for REST APIs and CDNs. Covers Cache-Control directives, freshness vs validation, ETag generation (strong vs weak), `If-Match` / `If-None-Match` (304/412/428), optimistic concurrency control / lost-update prevention, private vs shared caches, stale-while-revalidate, Vary, and CDN invalidation strategies. |
+| [`otel-observability`](./otel-observability/) | Apply OpenTelemetry across backend AND edge tiers — traces, metrics, logs — with enterprise-grade coverage of GCP (Cloud Run, GKE, Cloud Functions, Apigee), AWS (ECS, EKS, Lambda, API Gateway, Step Functions, EventBridge), edge (Cloudflare Workers, Vercel Edge, Lambda@Edge), browser RUM, and non-cloud OTLP backends (Datadog, Splunk, New Relic, Grafana Cloud, Honeycomb, Dynatrace, Elastic). Covers Collector production hardening (memory limiter, persistent queue, gateway pattern, mTLS, redaction, CMEK), enterprise log discipline (audit vs operational channels, retention tiers, SIEM, MDC baseline), multi-tenancy (isolation, sampling, chargeback), migration from X-Ray/Jaeger/Zipkin/StatsD/Prometheus/Datadog APM, CI testing, and 22 anti-patterns with severity-tagged review checklist. |
 
 More skills will be added over time. Each is self-contained — install only the ones you need.
 
@@ -22,8 +24,8 @@ Two ways:
 **Option 2 — build from source.**
 
 ```bash
-git clone https://github.com/<your-username>/api-engineering-agent-skills.git
-cd api-engineering-agent-skills
+git clone https://github.com/<your-username>/sde-agent-skills.git
+cd sde-agent-skills
 python scripts/build.py
 # .skill files are now in dist/
 ```
@@ -51,6 +53,12 @@ The `SKILL.md` format and folder structure are identical across runtimes per the
 │       ├── implementation.md
 │       └── ...
 ├── api-error-responses/
+│   ├── SKILL.md
+│   └── references/...
+├── api-http-caching/
+│   ├── SKILL.md
+│   └── references/...
+├── otel-observability/
 │   ├── SKILL.md
 │   └── references/...
 ├── scripts/
